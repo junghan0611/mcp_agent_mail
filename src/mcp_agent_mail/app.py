@@ -4188,7 +4188,10 @@ def build_mcp_server() -> FastMCP:
                 target_name = to_agent
         try:
             b = await _get_agent(target_project, target_name)
-        except NoResultFound:
+        except NoResultFound as exc:
+            # Don't auto-register if the agent was deregistered - they need to re-register explicitly
+            if "deregistered" in str(exc).lower():
+                raise
             if register_if_missing and validate_agent_name_format(target_name):
                 # Create the missing target identity using provided metadata (best effort)
                 b = await _get_or_create_agent(
