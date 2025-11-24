@@ -32,7 +32,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency fallback
     PathSpec = None  # type: ignore[assignment]
     GitWildMatchPattern = None  # type: ignore[assignment]
-from sqlalchemy import asc, bindparam, desc, func, or_, select, text, update
+from sqlalchemy import asc, bindparam, delete, desc, func, or_, select, text, update
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.orm import aliased
 
@@ -2876,6 +2876,164 @@ def build_mcp_server() -> FastMCP:
             await write_agent_profile(archive, _agent_to_dict(agent))
         await ctx.info(f"Created new agent identity '{agent.name}' for project '{project.human_key}'.")
         return _agent_to_dict(agent)
+
+    @mcp.tool(name="deregister_agent")
+    @_instrument_tool("deregister_agent", cluster=CLUSTER_IDENTITY, capabilities={"identity"}, project_arg="project_key", agent_arg="agent_name")
+    async def deregister_agent(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        delete_inbox: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Soft-delete an agent identity from a project.
+
+        This performs a soft-delete by setting deregistered_ts, cleans up contact links,
+        releases file reservations and build slots, and optionally removes inbox messages.
+
+        Parameters
+        ----------
+        project_key : str
+            Project slug or human key.
+        agent_name : str
+            Agent name to deregister.
+        delete_inbox : bool
+            If True, delete all inbox message_recipient records for this agent.
+
+        Returns
+        -------
+        dict
+            {
+                "agent_name": str,
+                "was_registered": bool,
+                "already_deregistered": bool,
+                "contact_links_removed": int,
+                "file_reservations_released": int,
+                "build_slots_released": int,
+                "inbox_records_deleted": int,
+            }
+
+        Notes
+        -----
+        - Idempotent: safe to call multiple times on the same agent
+        - Re-register with register_agent to reactivate a deregistered agent
+        - Contact links must be re-established after reactivation
+        """
+        project = await _get_project_by_identifier(project_key)
+        now = datetime.now(timezone.utc)
+
+        result: dict[str, Any] = {
+            "agent_name": agent_name,
+            "was_registered": False,
+            "already_deregistered": False,
+            "contact_links_removed": 0,
+            "file_reservations_released": 0,
+            "build_slots_released": 0,
+            "inbox_records_deleted": 0,
+        }
+
+        # 1. Look up agent (including deregistered ones)
+        await ensure_schema()
+        async with get_session() as session:
+            agent_result = await session.execute(
+                select(Agent).where(
+                    Agent.project_id == project.id,
+                    func.lower(Agent.name) == agent_name.lower()
+                )
+            )
+            agent = agent_result.scalars().first()
+
+            if not agent:
+                await ctx.info(f"Agent '{agent_name}' not found in project '{project.human_key}'.")
+                return result
+
+            result["was_registered"] = True
+
+            # 2. Check if already deregistered
+            if agent.deregistered_ts is not None:
+                result["already_deregistered"] = True
+                await ctx.info(f"Agent '{agent_name}' was already deregistered.")
+                # Still perform cleanup operations for idempotency
+
+            # 3. Set deregistered_ts
+            if agent.deregistered_ts is None:
+                agent.deregistered_ts = now
+                session.add(agent)
+                await session.commit()
+                await session.refresh(agent)
+
+            # 4. Delete contact links (both directions)
+            link_delete_result = await session.execute(
+                delete(AgentLink).where(
+                    or_(
+                        (AgentLink.a_agent_id == agent.id) & (AgentLink.a_project_id == project.id),
+                        (AgentLink.b_agent_id == agent.id) & (AgentLink.b_project_id == project.id),
+                    )
+                )
+            )
+            result["contact_links_removed"] = link_delete_result.rowcount
+
+            # 5. Release file reservations
+            reservation_result = await session.execute(
+                update(FileReservation)
+                .where(
+                    FileReservation.agent_id == agent.id,
+                    FileReservation.released_ts.is_(None)
+                )
+                .values(released_ts=now)
+            )
+            result["file_reservations_released"] = reservation_result.rowcount
+
+            # 6. Optionally delete inbox records
+            if delete_inbox:
+                inbox_result = await session.execute(
+                    delete(MessageRecipient).where(MessageRecipient.agent_id == agent.id)
+                )
+                result["inbox_records_deleted"] = inbox_result.rowcount
+
+            await session.commit()
+
+        # 7. Release build slots (file-based)
+        try:
+            archive = await ensure_archive(settings, project.slug)
+            build_slots_dir = archive.root / "build_slots"
+            if build_slots_dir.exists():
+                released_count = 0
+                # Search all slot directories for files matching this agent
+                for slot_dir in build_slots_dir.iterdir():
+                    if not slot_dir.is_dir():
+                        continue
+                    for json_file in slot_dir.glob("*.json"):
+                        try:
+                            data = json.loads(json_file.read_text(encoding="utf-8"))
+                            # Check if this slot belongs to the agent
+                            if data.get("agent") == agent_name or data.get("holder", "").startswith(f"{agent_name}__"):
+                                # Set expires_ts to now to release
+                                data["expires_ts"] = now.isoformat()
+                                data["released_ts"] = now.isoformat()
+                                json_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                                released_count += 1
+                        except Exception:
+                            continue
+                result["build_slots_released"] = released_count
+        except Exception:
+            pass  # Build slots are optional
+
+        # 8. Write updated profile to archive
+        try:
+            archive = await ensure_archive(settings, project.slug)
+            async with _archive_write_lock(archive):
+                await write_agent_profile(archive, _agent_to_dict(agent))
+        except Exception:
+            pass  # Archive write is best effort
+
+        await ctx.info(
+            f"Deregistered agent '{agent_name}' from project '{project.human_key}'. "
+            f"Links: {result['contact_links_removed']}, "
+            f"Reservations: {result['file_reservations_released']}, "
+            f"Slots: {result['build_slots_released']}"
+        )
+        return result
 
     @mcp.tool(name="send_message")
     @_instrument_tool(
