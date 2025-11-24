@@ -1551,6 +1551,9 @@ async def _get_or_create_agent(
         )
         agent = result.scalars().first()
         if agent:
+            # Reactivate if deregistered (clear soft-delete timestamp)
+            if agent.deregistered_ts is not None:
+                agent.deregistered_ts = None
             agent.program = program
             agent.model = model
             agent.task_description = task_description
